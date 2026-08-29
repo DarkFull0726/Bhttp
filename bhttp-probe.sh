@@ -42,7 +42,13 @@
 #        en modo bhttp la app ignora proxyHost/proxyPort.
 # ---------------------------------------------------------------------------
 #
-# Uso:   ./bhttp-probe.sh <host> [puerto] [opciones]
+# Uso:   ./bhttp-probe.sh                  <- MODO AUTOMATICO, en la propia VPS:
+#                                            busca los puertos del proto-server,
+#                                            detecta solo si llevan TLS y se
+#                                            prueba a si mismo. No pide nada.
+#        ./bhttp-probe.sh <host> [puerto] [opciones]   <- desde fuera (PC/movil)
+#
+#        opciones:
 #          sin puerto     prueba 80 (plano) y 443 (TLS) y se queda en el que ande
 #          --tls          fuerza TLS
 #          --no-tls       fuerza texto plano
@@ -76,12 +82,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-if [ -z "$HOST" ]; then
-  echo "uso: $0 <host> [puerto] [--tls|--no-tls] [--sni nombre] [-v] [--fast]" >&2
-  echo "     sin puerto prueba 80 y 443" >&2
-  exit 2
-fi
+# sin host = modo automatico contra el servidor local
+AUTO=0
+if [ -z "$HOST" ]; then AUTO=1; HOST="127.0.0.1"; fi
 [ -z "$SNI" ] && SNI="$HOST"
+SHOWHOST=""
 
 for req in openssl xxd sha256sum; do
   command -v "$req" >/dev/null 2>&1 || { echo "falta '$req' en el PATH" >&2; exit 2; }
@@ -267,6 +272,68 @@ probe_wire() {
   check_echo 1 "$plen" "$plain"
 }
 
+# ---------- descubrimiento (modo automatico) ----------
+
+# try_handshake -> 0 si en PORT/USETLS hay un servidor BHTTP. No imprime nada.
+try_handshake() {
+  local PAY RES ST PL
+  SESS="$(openssl rand -hex 16)"
+  PAY="$(probe_payload 0 0)"
+  RES="$(request 0 0 "$PAY" $(( ${#PAY} / 2 )))" || return 1
+  ST="${RES%% *}"; PL="${RES#* }"
+  if [ "$ST" != 0 ] && [ "$ST" != 2 ]; then return 1; fi
+  check_echo 0 0 "$PL"
+}
+
+# scan_port(puerto) -> imprime "plano" o "tls" si hay BHTTP; nada si no
+scan_port() {
+  PORT="$1"
+  if [ "$TLSMODE" != "on" ]; then
+    USETLS=0; if try_handshake; then printf 'plano'; return 0; fi
+  fi
+  if [ "$TLSMODE" != "off" ]; then
+    USETLS=1; if try_handshake; then printf 'tls'; return 0; fi
+  fi
+  return 1
+}
+
+# puertos donde puede haber un proto-server, mirando el sistema
+discover_ports() {
+  local out=""
+  # 1. puertos que escucha el propio proto-server
+  if command -v ss >/dev/null 2>&1; then
+    out="$(ss -tlnp 2>/dev/null | grep -i 'proto-server' \
+           | grep -oE ':[0-9]+ ' | tr -d ': ')"
+  fi
+  if [ -z "$out" ] && command -v netstat >/dev/null 2>&1; then
+    out="$(netstat -tlnp 2>/dev/null | grep -i 'proto-server' \
+           | grep -oE ':[0-9]+ ' | tr -d ': ')"
+  fi
+  # 2. puertos que aparezcan en la config del servidor
+  if [ -r /etc/config.json ]; then
+    out="$out
+$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' /etc/config.json \
+      | grep -oE '[0-9]+')"
+  fi
+  # 3. los del instalador oficial, por si acaso
+  out="$out
+80
+443"
+  printf '%s\n' "$out" | grep -E '^[0-9]+$' | sort -n -u
+}
+
+# ip publica, para decirle al usuario que poner en la app
+public_ip() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null)"
+  fi
+  if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s' "$ip"
+}
+
 # ---------- pasos ----------
 
 # 0 = todo bien, 1 = fallo definitivo, 2 = no habla BHTTP (se puede reintentar
@@ -428,7 +495,7 @@ run_target() {
         echo "            Lo que responde no parece un banner SSH; mira el texto de arriba." ;;
     esac
     echo
-    echo "  Para la app:  host $HOST   puerto $PORT   protocolo bhttp"
+    echo "  Para la app:  host ${SHOWHOST:-$HOST}   puerto $PORT   protocolo bhttp"
     [ "$USETLS" = 1 ] && echo "                con TLS activado y SNI = $SNI"
     return 0
   fi
@@ -442,6 +509,74 @@ run_target() {
 
 # ---------- main ----------
 
+# ===== modo automatico: en la propia VPS, sin argumentos =====
+if [ "$AUTO" = 1 ]; then
+  echo "BHTTP - modo automatico (servidor local)"
+  echo
+
+  if [ -r /etc/config.json ]; then
+    echo "  config del servidor : /etc/config.json"
+  else
+    echo "  config del servidor : no encontrada (/etc/config.json)"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    est="$(systemctl is-active proto-server 2>/dev/null)"
+    echo "  proto-server.service: ${est:-desconocido}"
+  fi
+
+  CAND="$(discover_ports)"
+  echo "  puertos a probar    : $(printf '%s' "$CAND" | tr '\n' ' ')"
+  echo
+  echo "Buscando servidores BHTTP..."
+
+  declare -a OKPORT=() OKVIA=()
+  for p in $CAND; do
+    printf '  puerto %-6s ... ' "$p"
+    if via="$(scan_port "$p")"; then
+      echo "BHTTP OK ($via)"
+      OKPORT+=("$p"); OKVIA+=("$via")
+    else
+      echo "nada"
+    fi
+  done
+  echo
+
+  if [ "${#OKPORT[@]}" -eq 0 ]; then
+    echo "No encontre ningun servidor BHTTP escuchando en esta maquina."
+    echo
+    echo "Comprueba:   systemctl status proto-server"
+    echo "             cat /etc/config.json"
+    echo "             ss -tlnp | grep proto-server"
+    exit 1
+  fi
+
+  echo "Encontrados ${#OKPORT[@]}: $(for i in "${!OKPORT[@]}"; do printf '%s(%s) ' "${OKPORT[$i]}" "${OKVIA[$i]}"; done)"
+  SHOWHOST="$(public_ip)"
+  [ -n "$SHOWHOST" ] && echo "IP publica de esta VPS: $SHOWHOST"
+  echo
+  echo "Prueba completa en el puerto ${OKPORT[0]}:"
+  echo
+
+  PORT="${OKPORT[0]}"
+  if [ "${OKVIA[0]}" = "tls" ]; then USETLS=1; else USETLS=0; fi
+  run_target; RC=$?
+
+  if [ "${#OKPORT[@]}" -gt 1 ]; then
+    echo
+    echo "  Los otros puertos que tambien responden BHTTP:"
+    for i in "${!OKPORT[@]}"; do
+      [ "$i" = 0 ] && continue
+      echo "    puerto ${OKPORT[$i]} (${OKVIA[$i]}) - pruebalo con:  $0 ${SHOWHOST:-<host>} ${OKPORT[$i]}"
+    done
+  fi
+  echo
+  echo "  Recuerda: esto se prueba contra 127.0.0.1, asi que el paso 3 no mide"
+  echo "  la red del operador. Para eso, corre el script desde el movil o el PC:"
+  echo "      $0 ${SHOWHOST:-<tu-servidor>}"
+  exit "$RC"
+fi
+
+# ===== modo normal: host dado por el usuario =====
 # que puertos y con que transporte
 declare -a TRY_PORT=() TRY_TLS=()
 if [ -n "$PORT" ]; then
