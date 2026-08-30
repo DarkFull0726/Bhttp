@@ -162,6 +162,11 @@ MAGIC = b"BHP1"
 # en vez de esperar el backoff del cliente (auth PAM que tardaba ~37s -> <2s).
 LONGPOLL = 6.0
 
+def log(msg):
+    # a stderr -> systemd lo captura en `journalctl -u bhttp`
+    sys.stderr.write("[bhttp] %s\n" % msg)
+    sys.stderr.flush()
+
 def keystream(sess, mode, seq, d, n):
     out = bytearray(); c = 0
     while len(out) < n:
@@ -225,20 +230,25 @@ class Session:
     def _connect(self):
         host, port = self.backend
         self.sock = socket.create_connection((host, port), timeout=15)
+        log("sesion %s: conectada al backend %s:%d" % (self.sess.hex()[:8], host, port))
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
+        total = 0
         try:
             while True:
                 data = self.sock.recv(65536)
                 if not data:
                     break
+                total += len(data)
                 with self.cond:
                     self.down_raw += data
                     self.cond.notify_all()
-        except Exception:
-            pass
+        except Exception as e:
+            log("sesion %s: error leyendo del backend: %s" % (self.sess.hex()[:8], e))
         finally:
+            log("sesion %s: el backend cerro (recibidos %d B en bajada)"
+                % (self.sess.hex()[:8], total))
             with self.cond:
                 self.eof = True
                 self.cond.notify_all()
@@ -319,8 +329,17 @@ class Server:
         with self.slock:
             s = self.sessions.get(sess)
             if s is None or s.closed:
+                # sesion nueva (o reconexion): cierra las huerfanas para no dejar
+                # conexiones colgando en el sshd (el cliente usa 1 SID por conexion;
+                # al reconectar genera otro). Evita agotar el backend con el tiempo.
+                for old_sid, old in list(self.sessions.items()):
+                    if old_sid != sess:
+                        old.close()
+                        del self.sessions[old_sid]
                 s = Session(sess, self.backend)
                 self.sessions[sess] = s
+                log("sesion %s: registrada (sesiones vivas: %d)"
+                    % (sess.hex()[:8], len(self.sessions)))
             return s
 
     def probe_reply(self, mode, size, req_payload):
@@ -398,6 +417,10 @@ class Server:
                     return
         except (EOFError, ConnectionError, socket.timeout, OSError):
             pass
+        except Exception as e:
+            # una excepcion inesperada aqui cierra la conexion y el cliente ve
+            # EOFException: la registramos para poder diagnosticarla.
+            log("handle: excepcion inesperada: %r" % e)
         finally:
             try:
                 conn.close()
