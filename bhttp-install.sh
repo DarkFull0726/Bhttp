@@ -230,6 +230,11 @@ class Session:
     def _connect(self):
         host, port = self.backend
         self.sock = socket.create_connection((host, port), timeout=15)
+        # create_connection deja ese timeout tambien para las lecturas: un sshd
+        # callado (idle) dispararia recv()->timed out y cerrariamos el tunel vivo.
+        # Lo quitamos: recv() bloquea hasta que haya datos o el backend cierre de
+        # verdad. Un backend idle NO esta muerto.
+        self.sock.settimeout(None)
         log("sesion %s: conectada al backend %s:%d" % (self.sess.hex()[:8], host, port))
         threading.Thread(target=self._reader, daemon=True).start()
 
