@@ -290,26 +290,37 @@ class Session:
     # kex sin colgar (nunca se pierde un slot: los datos futuros caen en slots
     # crecientes que el cliente pedira en la ronda siguiente).
     def download(self, seq, maxlen, deadline):
+        # ORDEN ESTRICTO: los slots se sirven de uno en uno (down_assign). Un slot
+        # solo recibe datos cuando es su turno (seq == down_assign), y quien pide
+        # un slot futuro ESPERA a que le llegue el turno. Asi down_assign avanza al
+        # mismo ritmo que el cliente entrega (nextRead) -> no se adelanta ni deja
+        # datos en slots que el cliente ya paso. En 'deadline' (compartido por el
+        # batch) los slots sin datos se dan por vacios y se avanza, para no colgar.
         if maxlen <= 0:
             maxlen = 1399
         with self.cond:
             while True:
-                if seq < self.down_assign:             # slot ya servido: retransmite
+                if seq < self.down_assign:             # ya servido: retransmite
                     return self.down_chunks.get(seq, b"")
-                if self.down_raw:                      # hay datos: asigna hasta seq
-                    while self.down_assign <= seq:
-                        if self.down_raw:
-                            take = bytes(self.down_raw[:maxlen])
-                            del self.down_raw[:maxlen]
-                            self.down_chunks[self.down_assign] = take
+                if seq == self.down_assign:            # mi turno
+                    if self.down_raw:
+                        take = bytes(self.down_raw[:maxlen])
+                        del self.down_raw[:maxlen]
+                        self.down_chunks[self.down_assign] = take
                         self.down_assign += 1
-                    return self.down_chunks.get(seq, b"")
-                # sin datos y seq >= down_assign
-                if seq == self.down_assign and not self.eof and time.time() < deadline:
+                        self.cond.notify_all()
+                        return take
+                    if self.eof:
+                        self.down_assign += 1
+                        self.cond.notify_all()
+                        return b""
+                # seq > down_assign (turno futuro) o sin datos aun
+                if not self.eof and time.time() < deadline:
                     self.cond.wait(timeout=max(0.01, deadline - time.time()))
-                    continue                           # reevalua tras esperar
-                while self.down_assign <= seq:         # timeout/futuro/eof: slot vacio
+                    continue
+                while self.down_assign <= seq:         # timeout/eof: vacios hasta seq
                     self.down_assign += 1
+                self.cond.notify_all()
                 return b""
 
     # --- ack: libera lo ya consumido por el cliente ---
@@ -411,19 +422,14 @@ class Server:
                         chunk_size = 1399
                     if count <= 0:
                         count = 1
-                    # CLAVE: el cliente lee las 'count' respuestas ANTES de entregar
-                    # nada al SSH (downloadBatch), asi que el long-poll solo puede
-                    # esperar mientras el batch NO tenga nada que entregar. En cuanto
-                    # un slot trae datos, los siguientes salen al instante; si no,
-                    # el banner/KEXINIT se retrasaria 'LONGPOLL' por slot y el kex
-                    # (20s) caeria. Solo se espera cuando el batch entero esta vacio.
+                    # deadline COMPARTIDO por el batch: los slots se sirven en orden
+                    # y esperan datos hasta el deadline comun. Asi down_assign avanza
+                    # a la par de nextRead (8 por batch) y no se desincroniza; un dato
+                    # que llega tras un idle cae en el slot que el cliente pedira
+                    # enseguida, no en uno muy adelantado (evita el timeout de datos).
                     deadline = time.time() + LONGPOLL
-                    entregado = False
                     for i in range(count):
-                        dl = deadline if not entregado else 0.0   # 0 = inmediato
-                        chunk = s.download(seq + i, chunk_size, dl)
-                        if chunk:
-                            entregado = True
+                        chunk = s.download(seq + i, chunk_size, deadline)
                         send_data(conn, sess, mode, seq + i, chunk)
                 elif mode == 4:                    # ack
                     s.ack(seq)
