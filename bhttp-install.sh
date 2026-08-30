@@ -204,35 +204,37 @@ class Session:
                     self.closed = True
                 self.up_next += 1
 
-    # --- bajada: entrega el chunk seq pedido, troceando a <= maxlen ---
-    # wait=True espera un poco a que haya datos (long-poll corto); wait=False
-    # devuelve al instante lo que haya. En un batch solo el primer chunk espera,
-    # asi los chunks vacios que le siguen no cuelgan al cliente.
-    def download(self, seq, maxlen, wait=True):
+    # --- bajada: entrega el chunk 'seq' del stream, en ORDEN ESTRICTO ---
+    # El cliente entrega los chunks al SSH por orden de seq y avanza tambien en los
+    # vacios (BhttpBridge.downloadBatch: nextRead++ siempre). Por eso un chunk solo
+    # puede ser vacio en EOF: NUNCA "aun no hay datos". Los chunks se cortan en
+    # orden (down_assign); quien pide un seq futuro espera a que se produzca, no
+    # recibe vacio. Si no se alcanza en 'timeout', se lanza para que el cliente
+    # reintente el batch (en vez de tragarse un hueco en el stream).
+    def download(self, seq, maxlen, timeout=15.0):
         if maxlen <= 0:
-            maxlen = 1350
-        deadline = time.time() + (1.5 if wait else 0.0)
+            maxlen = 1399
+        deadline = time.time() + timeout
         with self.cond:
             while True:
-                if seq in self.down_chunks:
+                if seq in self.down_chunks:            # ya producido: (re)transmite
                     return self.down_chunks[seq]
-                # asignar chunks pendientes en orden mientras haya datos
-                while self.down_assign <= seq and self.down_raw:
+                if self.down_raw:                      # hay datos: corta el siguiente
                     take = bytes(self.down_raw[:maxlen])
                     del self.down_raw[:maxlen]
                     self.down_chunks[self.down_assign] = take
                     self.down_assign += 1
-                if seq in self.down_chunks:
+                    self.cond.notify_all()
+                    continue                           # reevalua (quiza ya es 'seq')
+                if self.eof:                           # fin real: rellena vacios hasta seq
+                    while self.down_assign <= seq:
+                        self.down_chunks[self.down_assign] = b""
+                        self.down_assign += 1
+                    self.cond.notify_all()
                     return self.down_chunks[seq]
-                if self.eof and not self.down_raw:
-                    # nada mas que entregar: chunk vacio (fin de flujo)
-                    self.down_chunks[seq] = b""
-                    if self.down_assign <= seq:
-                        self.down_assign = seq + 1
-                    return b""
                 if time.time() >= deadline:
-                    return b""
-                self.cond.wait(timeout=deadline - time.time())
+                    raise TimeoutError("chunk %d no disponible aun" % seq)
+                self.cond.wait(timeout=max(0.05, deadline - time.time()))
 
     # --- ack: libera lo ya consumido por el cliente ---
     def ack(self, seq):
@@ -303,7 +305,12 @@ class Server:
                     s.upload(seq, payload)
                     send_frame(conn, sess, mode, seq, 0, b"")
                 elif mode == 2:                    # bajada simple
-                    chunk = s.download(seq, ln if ln > 0 else 1399)
+                    # si el chunk no esta listo, cerramos: el cliente reintenta
+                    # (nunca mandar vacio prematuro, romperia el orden del stream)
+                    try:
+                        chunk = s.download(seq, ln if ln > 0 else 1399)
+                    except TimeoutError:
+                        return
                     send_data(conn, sess, mode, seq, chunk)
                 elif mode == 3:                    # lote de bajadas
                     # payload = [chunkSize:4BE][reservado:1][count:1]
@@ -316,9 +323,12 @@ class Server:
                         chunk_size = 1399
                     if count <= 0:
                         count = 1
-                    for i in range(count):
-                        chunk = s.download(seq + i, chunk_size, wait=(i == 0))
-                        send_data(conn, sess, mode, seq + i, chunk)
+                    try:
+                        for i in range(count):
+                            chunk = s.download(seq + i, chunk_size)
+                            send_data(conn, sess, mode, seq + i, chunk)
+                    except TimeoutError:
+                        return                     # cierra; el cliente reintenta el batch
                 elif mode == 4:                    # ack
                     s.ack(seq)
                     send_frame(conn, sess, mode, seq, 0, b"")
@@ -437,17 +447,24 @@ try:
     # 2) registro + subida (mode 1, status 0)
     sk=open_sock(); send(sk,1,0,b""); assert resp(sk)[0]==0, "registro"; sk.close()
     sk=open_sock(); send(sk,1,0,mask(b"SSH-2.0-Test\r\n",1,0,0)); resp(sk); sk.close()
-    # 3) batch (mode 3) tal cual Frontera: prefijo 4 bytes, sin relleno,
-    #    payload de peticion enmascarado. Valida como BhttpBridge.downloadBatch.
+    # 3) batch (mode 3) como Frontera: prefijo 4 bytes, sin relleno, payload
+    #    de peticion enmascarado. La bajada se produce en orden estricto, asi
+    #    que solo el chunk 0 (el banner del SSH) esta disponible sin subir mas;
+    #    leemos con socket-timeout corto y validamos ese chunk (los siguientes
+    #    esperarian datos, que es correcto: el flujo real los va produciendo).
     pay=(1399).to_bytes(4,"big")+bytes([0,8])
-    sk=open_sock(); send(sk,3,0,mask(pay,3,0,0))
+    sk=open_sock(); sk.settimeout(4); send(sk,3,0,mask(pay,3,0,0))
     back=b""; okfmt=True
-    for i in range(8):
-        st,body=resp(sk)
-        if st!=2 or len(body)<4: okfmt=False; break
-        dl=int.from_bytes(body[0:4],"big")
-        if dl!=len(body)-4: okfmt=False; break
-        if dl: back+=mask(body[4:4+dl],3,i,1)
+    try:
+        for i in range(8):
+            st,body=resp(sk)
+            if st!=2 or len(body)<4: okfmt=False; break
+            dl=int.from_bytes(body[0:4],"big")
+            if dl!=len(body)-4: okfmt=False; break
+            if dl: back+=mask(body[4:4+dl],3,i,1)
+            if back.startswith(b"SSH-"): break   # banner recibido: suficiente
+    except socket.timeout:
+        pass
     sk.close()
     ok = back.startswith(b"SSH-")
     print("HANDSHAKE_OK" if okfmt else "FORMATO_MALO")
