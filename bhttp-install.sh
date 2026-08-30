@@ -362,7 +362,7 @@ class Server:
                 if mode == 1:                      # subida (len 0 = solo abrir)
                     s.upload(seq, payload)
                     send_frame(conn, sess, mode, seq, 0, b"")
-                elif mode == 2:                    # bajada simple
+                elif mode == 2:                    # bajada simple (rara vez usada)
                     chunk = s.download(seq, ln if ln > 0 else 1399, time.time() + LONGPOLL)
                     send_data(conn, sess, mode, seq, chunk)
                 elif mode == 3:                    # lote de bajadas
@@ -376,9 +376,19 @@ class Server:
                         chunk_size = 1399
                     if count <= 0:
                         count = 1
-                    deadline = time.time() + LONGPOLL   # long-poll, compartido
+                    # CLAVE: el cliente lee las 'count' respuestas ANTES de entregar
+                    # nada al SSH (downloadBatch), asi que el long-poll solo puede
+                    # esperar mientras el batch NO tenga nada que entregar. En cuanto
+                    # un slot trae datos, los siguientes salen al instante; si no,
+                    # el banner/KEXINIT se retrasaria 'LONGPOLL' por slot y el kex
+                    # (20s) caeria. Solo se espera cuando el batch entero esta vacio.
+                    deadline = time.time() + LONGPOLL
+                    entregado = False
                     for i in range(count):
-                        chunk = s.download(seq + i, chunk_size, deadline)
+                        dl = deadline if not entregado else 0.0   # 0 = inmediato
+                        chunk = s.download(seq + i, chunk_size, dl)
+                        if chunk:
+                            entregado = True
                         send_data(conn, sess, mode, seq + i, chunk)
                 elif mode == 4:                    # ack
                     s.ack(seq)
