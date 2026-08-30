@@ -106,7 +106,7 @@ cat > "$SERVER_PY" <<'PYEOF'
 # Trama respuesta: status(1) len(4 BE) + payload enmascarado
 # Mascara        : XOR con SHA256(sessionId||mode||seq||dir||contador), dir 0=req 1=resp
 # Modos          : 0=probe 1=subida 2=bajada 3=lote 4=ack
-import argparse, hashlib, socket, sys, threading, time
+import argparse, hashlib, socket, struct, sys, threading, time
 
 MAGIC = b"BHP1"
 
@@ -135,6 +135,19 @@ def recvn(sock, n):
 def send_frame(sock, sess, mode, seq, status, payload):
     body = mask(payload, sess, mode, seq, 1) if payload else b""
     sock.sendall(bytes([status]) + len(body).to_bytes(4, "big") + body)
+
+def send_data(sock, sess, mode, seq, data, envelope):
+    # respuesta de bajada con envelope de tamano fijo (status 2), como espera la app:
+    #   [4B longitud_real BE EN CLARO] [datos enmascarados] [relleno] hasta 'envelope'
+    # El prefijo de longitud va sin mascara (el cliente lo lee del crudo antes de
+    # desenmascarar, Lbw.y()); solo los datos se enmascaran, desde el contador 0.
+    # Tamano fijo = anti-DPI; el chunk vacio (longitud 0) tambien es valido.
+    real = len(data)
+    masked = mask(data, sess, mode, seq, 1) if data else b""
+    body = real.to_bytes(4, "big") + masked
+    if len(body) < envelope:
+        body += b"\x00" * (envelope - len(body))
+    sock.sendall(bytes([2]) + len(body).to_bytes(4, "big") + body)
 
 def send_error(sock, msg):
     b = msg.encode()
@@ -193,14 +206,18 @@ class Session:
                 self.up_next += 1
 
     # --- bajada: entrega el chunk seq pedido, troceando a <= maxlen ---
-    def download(self, seq, maxlen, timeout=8.0):
+    # wait=True espera un poco a que haya datos (long-poll corto); wait=False
+    # devuelve al instante lo que haya. En un batch solo el primer chunk espera,
+    # asi los chunks vacios que le siguen no cuelgan al cliente.
+    def download(self, seq, maxlen, wait=True):
         if maxlen <= 0:
             maxlen = 1350
-        deadline = time.time() + timeout
+        deadline = time.time() + (3.0 if wait else 0.0)
         with self.cond:
             while True:
                 if seq in self.down_chunks:
                     return self.down_chunks[seq]
+                # asignar chunks pendientes en orden mientras haya datos
                 while self.down_assign <= seq and self.down_raw:
                     take = bytes(self.down_raw[:maxlen])
                     del self.down_raw[:maxlen]
@@ -209,6 +226,7 @@ class Session:
                 if seq in self.down_chunks:
                     return self.down_chunks[seq]
                 if self.eof and not self.down_raw:
+                    # nada mas que entregar: chunk vacio (fin de flujo)
                     self.down_chunks[seq] = b""
                     if self.down_assign <= seq:
                         self.down_assign = seq + 1
@@ -272,29 +290,34 @@ class Server:
                     raw = recvn(conn, ln)
                     payload = mask(raw, sess, mode, seq, 0)
 
-                if payload[:4] == MAGIC:  # sondeo de camino
+                # --- sondeo de camino (BHP1) ---
+                if payload[:4] == MAGIC:
                     size = int.from_bytes(payload[6:10], "big") if len(payload) >= 10 else 0
                     pmode = payload[5] if len(payload) >= 6 else mode
                     send_frame(conn, sess, mode, seq, 0,
                                self.probe_reply(pmode, size, payload))
                     continue
 
+                # --- datos ---
                 s = self.get_session(sess)
                 if mode == 1:                      # subida (len 0 = solo abrir)
                     s.upload(seq, payload)
                     send_frame(conn, sess, mode, seq, 0, b"")
                 elif mode == 2:                    # bajada
-                    chunk = s.download(seq, ln)
-                    send_frame(conn, sess, mode, seq, 0, chunk)
+                    env = ln if ln > 4 else 1399   # tamano fijo del envelope
+                    chunk = s.download(seq, env - 4)
+                    send_data(conn, sess, mode, seq, chunk, env)
                 elif mode == 3:                    # lote de bajadas
                     if len(payload) >= 6:
-                        maxlen = int.from_bytes(payload[0:4], "big")
+                        env = int.from_bytes(payload[0:4], "big")
                         count = int.from_bytes(payload[4:6], "big")
                     else:
-                        maxlen, count = 1350, 1
+                        env, count = 1399, 1
+                    if env <= 4:
+                        env = 1399
                     for i in range(count):
-                        chunk = s.download(seq + i, maxlen)
-                        send_frame(conn, sess, mode, seq + i, 0, chunk)
+                        chunk = s.download(seq + i, env - 4, wait=(i == 0))
+                        send_data(conn, sess, mode, seq + i, chunk, env)
                 elif mode == 4:                    # ack
                     s.ack(seq)
                     send_frame(conn, sess, mode, seq, 0, b"")
