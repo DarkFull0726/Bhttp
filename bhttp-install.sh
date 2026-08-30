@@ -204,37 +204,42 @@ class Session:
                     self.closed = True
                 self.up_next += 1
 
-    # --- bajada: entrega el chunk 'seq' del stream, en ORDEN ESTRICTO ---
-    # El cliente entrega los chunks al SSH por orden de seq y avanza tambien en los
-    # vacios (BhttpBridge.downloadBatch: nextRead++ siempre). Por eso un chunk solo
-    # puede ser vacio en EOF: NUNCA "aun no hay datos". Los chunks se cortan en
-    # orden (down_assign); quien pide un seq futuro espera a que se produzca, no
-    # recibe vacio. Si no se alcanza en 'timeout', se lanza para que el cliente
-    # reintente el batch (en vez de tragarse un hueco en el stream).
-    def download(self, seq, maxlen, timeout=15.0):
+    # --- bajada: asigna el slot 'seq' AL INSTANTE (datos si hay, vacio si no) ---
+    # El cliente pide TODOS los slots en orden global (ronda 1: 0..255, ronda 2:
+    # 256..511, ...) a traves de sus 32 conexiones, y entrega al SSH por nextRead
+    # avanzando tambien en los vacios. Un slot vacio no aporta bytes, asi que el
+    # stream sale bien MIENTRAS los datos se asignen a slots crecientes. Por eso:
+    # cada peticion asigna los slots hasta 'seq', cortando down_raw cuando hay
+    # datos y dejando vacio cuando no; el contador avanza SIEMPRE. Sin esperas ni
+    # timeouts: los datos que lleguen mas tarde caen en slots que el cliente
+    # pedira en la siguiente ronda. (El cliente hace su propio backoff.)
+    # 'deadline' (compartido por todo un batch) permite un long-poll corto: el
+    # primer slot del batch espera un poco a que haya datos; los siguientes ya lo
+    # ven consumido y salen al instante. Reduce el polling y baja la latencia del
+    # kex sin colgar (nunca se pierde un slot: los datos futuros caen en slots
+    # crecientes que el cliente pedira en la ronda siguiente).
+    def download(self, seq, maxlen, deadline):
         if maxlen <= 0:
             maxlen = 1399
-        deadline = time.time() + timeout
         with self.cond:
             while True:
-                if seq in self.down_chunks:            # ya producido: (re)transmite
-                    return self.down_chunks[seq]
-                if self.down_raw:                      # hay datos: corta el siguiente
-                    take = bytes(self.down_raw[:maxlen])
-                    del self.down_raw[:maxlen]
-                    self.down_chunks[self.down_assign] = take
-                    self.down_assign += 1
-                    self.cond.notify_all()
-                    continue                           # reevalua (quiza ya es 'seq')
-                if self.eof:                           # fin real: rellena vacios hasta seq
+                if seq < self.down_assign:             # slot ya servido: retransmite
+                    return self.down_chunks.get(seq, b"")
+                if self.down_raw:                      # hay datos: asigna hasta seq
                     while self.down_assign <= seq:
-                        self.down_chunks[self.down_assign] = b""
+                        if self.down_raw:
+                            take = bytes(self.down_raw[:maxlen])
+                            del self.down_raw[:maxlen]
+                            self.down_chunks[self.down_assign] = take
                         self.down_assign += 1
-                    self.cond.notify_all()
-                    return self.down_chunks[seq]
-                if time.time() >= deadline:
-                    raise TimeoutError("chunk %d no disponible aun" % seq)
-                self.cond.wait(timeout=max(0.05, deadline - time.time()))
+                    return self.down_chunks.get(seq, b"")
+                # sin datos y seq >= down_assign
+                if seq == self.down_assign and not self.eof and time.time() < deadline:
+                    self.cond.wait(timeout=max(0.01, deadline - time.time()))
+                    continue                           # reevalua tras esperar
+                while self.down_assign <= seq:         # timeout/futuro/eof: slot vacio
+                    self.down_assign += 1
+                return b""
 
     # --- ack: libera lo ya consumido por el cliente ---
     def ack(self, seq):
@@ -305,12 +310,7 @@ class Server:
                     s.upload(seq, payload)
                     send_frame(conn, sess, mode, seq, 0, b"")
                 elif mode == 2:                    # bajada simple
-                    # si el chunk no esta listo, cerramos: el cliente reintenta
-                    # (nunca mandar vacio prematuro, romperia el orden del stream)
-                    try:
-                        chunk = s.download(seq, ln if ln > 0 else 1399)
-                    except TimeoutError:
-                        return
+                    chunk = s.download(seq, ln if ln > 0 else 1399, time.time() + 0.3)
                     send_data(conn, sess, mode, seq, chunk)
                 elif mode == 3:                    # lote de bajadas
                     # payload = [chunkSize:4BE][reservado:1][count:1]
@@ -323,12 +323,10 @@ class Server:
                         chunk_size = 1399
                     if count <= 0:
                         count = 1
-                    try:
-                        for i in range(count):
-                            chunk = s.download(seq + i, chunk_size)
-                            send_data(conn, sess, mode, seq + i, chunk)
-                    except TimeoutError:
-                        return                     # cierra; el cliente reintenta el batch
+                    deadline = time.time() + 0.3   # long-poll corto, compartido
+                    for i in range(count):
+                        chunk = s.download(seq + i, chunk_size, deadline)
+                        send_data(conn, sess, mode, seq + i, chunk)
                 elif mode == 4:                    # ack
                     s.ack(seq)
                     send_frame(conn, sess, mode, seq, 0, b"")
