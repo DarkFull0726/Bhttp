@@ -341,10 +341,11 @@ class Server:
                 sess = hdr[1:17]
                 seq = int.from_bytes(hdr[17:25], "big")
                 ln = int.from_bytes(hdr[25:29], "big")
-                # solo 0/1/3 traen bytes; en 2 (bajada) y 4 (ack) el campo len
-                # es semantico (tamano pedido / seq), no hay payload que leer
+                # Traen bytes: 0/1 (probe o subida), 2 (PROBE de download: 10B BHP1,
+                # espera respuesta de 'param' bytes) y 3 (batch: 6B [chunkSize][count]).
+                # El 4 (ack) no trae payload; su 'len' es semantico.
                 payload = b""
-                if ln and mode in (0, 1, 3):
+                if ln and mode in (0, 1, 2, 3):
                     raw = recvn(conn, ln)
                     payload = mask(raw, sess, mode, seq, 0)
 
