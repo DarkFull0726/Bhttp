@@ -28,7 +28,7 @@ UNIT="/etc/systemd/system/bhttp.service"
 SERVICE="bhttp"
 CANDIDATOS=(8080 80 8443 443 2082 2095 8880 2052 3128)
 
-PUERTO=""; SSHPORT=22; DESINSTALAR=0; NUEVO_USER=""; NUEVO_PASS=""
+PUERTO=""; SSHPORT=22; DESINSTALAR=0; NUEVO_USER=""; NUEVO_PASS=""; SOLO_DIAG=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +37,7 @@ while [ $# -gt 0 ]; do
     --crear-usuario) shift; NUEVO_USER="$1" ;;
     --clave)         shift; NUEVO_PASS="$1" ;;
     --desinstalar)   DESINSTALAR=1 ;;
+    --diag)          SOLO_DIAG=1 ;;
     -h|--help)       sed -n '2,20p' "$0"; exit 0 ;;
     *)               echo "opcion desconocida: $1" >&2; exit 2 ;;
   esac
@@ -58,10 +59,13 @@ crear_usuario() {
   if id "$u" >/dev/null 2>&1; then
     info "el usuario '$u' ya existe; solo actualizo la clave"
   else
-    useradd -M -s /usr/sbin/nologin "$u" 2>/dev/null \
-      || useradd -M -s /bin/false "$u" \
+    # /bin/bash (no nologin): algunos SSH cierran la conexion tras la auth si el
+    # usuario tiene nologin y el cliente pide algo mas que un forward puro. Con un
+    # shell real, el forward/SOCKS del tunel funciona seguro. Sin acceso extra:
+    # el usuario solo tiene la clave para el tunel.
+    useradd -M -s /bin/bash "$u" \
       || { rojo "no pude crear el usuario '$u'"; return 1; }
-    info "usuario '$u' creado (sin shell, solo para el tunel)"
+    info "usuario '$u' creado (shell /bin/bash, compatible con el forward del tunel)"
   fi
   if [ -z "$p" ]; then
     p="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 12)"
@@ -69,10 +73,39 @@ crear_usuario() {
     info "clave generada automaticamente"
   fi
   echo "$u:$p" | chpasswd || { rojo "no pude poner la clave"; return 1; }
-  # nologin no deja abrir sesion SSH normal, pero el tunel (con -N, sin shell) si;
-  # aun asi permitimos el shell falso por si el cliente pide PTY.
   USER_FINAL="$u"; PASS_FINAL="$p"
   return 0
+}
+
+# diagnostico del entorno SSH/red: la causa mas comun de que el tunel conecte,
+# autentique y luego "Connection reset"/"Read timed out" al navegar es que el SSH
+# no permite forward o la VPS no tiene salida, NO el protocolo BHTTP.
+diagnostico_ssh() {
+  paso "diag" "Comprobando el entorno SSH/red"
+  # 1) AllowTcpForwarding: el tunel necesita forward. Por defecto suele ser 'yes'.
+  local cfg="/etc/ssh/sshd_config" fwd=""
+  [ -r "$cfg" ] && fwd="$(grep -iE '^[[:space:]]*AllowTcpForwarding' "$cfg" | tail -1 | awk '{print tolower($2)}')"
+  if [ "$fwd" = "no" ]; then
+    rojo "  AllowTcpForwarding no  -> el tunel NO podra salir. Cambialo a yes:"
+    echo "     sed -i 's/^[[:space:]]*AllowTcpForwarding.*/AllowTcpForwarding yes/' $cfg"
+    echo "     systemctl restart ssh"
+  else
+    info "AllowTcpForwarding: ${fwd:-yes (por defecto)} -> OK"
+  fi
+  # 2) salida TCP a 8.8.8.8:53 (lo primero que hace el cliente tras conectar)
+  if timeout 5 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
+    info "salida TCP a 8.8.8.8:53 (DNS): OK"
+  else
+    rojo "  La VPS NO alcanza 8.8.8.8:53 por TCP -> el DNS del tunel fallara."
+    echo "     Revisa el firewall de salida del proveedor / la red de la VPS."
+  fi
+  # 3) sshd escuchando en el puerto backend
+  if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE ":$SSHPORT\b"; then
+    info "sshd escuchando en el puerto $SSHPORT: OK"
+  else
+    rojo "  No veo sshd escuchando en el puerto $SSHPORT (backend del tunel)."
+    echo "     Comprueba:  systemctl status ssh"
+  fi
 }
 
 if [ -n "$NUEVO_USER" ]; then
@@ -87,6 +120,13 @@ if [ -n "$NUEVO_USER" ]; then
   # si solo se pidio crear usuario (sin nada mas), terminamos aqui
   [ -z "$PUERTO$DESINSTALAR" ] && { echo; echo "Usuario creado. Para (re)instalar el servidor:  sudo bash $0"; exit 0; }
   echo
+fi
+
+# ------------------------------------------------------------ solo diagnostico
+if [ "$SOLO_DIAG" = 1 ]; then
+  echo "=== Diagnostico del entorno del tunel ==="
+  diagnostico_ssh
+  exit 0
 fi
 
 # ------------------------------------------------------------ desinstalar
@@ -603,7 +643,10 @@ if echo "$VERIF" | grep -q HANDSHAKE_OK; then
     echo "  Si tu SSH usa otro puerto:  sudo bash $0 --ssh-puerto <n> --puerto $PUERTO"
   fi
   echo
+  diagnostico_ssh
+  echo
   echo "  Gestion:  systemctl status $SERVICE | restart | stop"
+  echo "  Log en vivo (util si el tunel cae al navegar):  journalctl -u $SERVICE -f"
   echo "  Quitar :  sudo bash $0 --desinstalar"
   exit 0
 fi
