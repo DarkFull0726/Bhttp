@@ -160,7 +160,7 @@ MAGIC = b"BHP1"
 # reader hace notify). Debe quedar por debajo del read-timeout del cliente (~8s)
 # para que no vea "Read timed out"; asi cada round-trip del SSH es casi instantaneo
 # en vez de esperar el backoff del cliente (auth PAM que tardaba ~37s -> <2s).
-LONGPOLL = 6.0
+LONGPOLL = 2.0
 
 def log(msg):
     # a stderr -> systemd lo captura en `journalctl -u bhttp`
@@ -168,11 +168,15 @@ def log(msg):
     sys.stderr.flush()
 
 def keystream(sess, mode, seq, d, n):
+    # nonce = sess(16) mode(1) seq(8) dir(1) contador(4). El prefijo (29 B) es fijo;
+    # solo cambia el contador, asi que lo precomputamos y clonamos el hash por bloque.
+    prefix = sess + bytes([mode]) + seq.to_bytes(8, "big") + bytes([d])
+    base = hashlib.sha256(prefix)
     out = bytearray(); c = 0
     while len(out) < n:
-        out += hashlib.sha256(sess + bytes([mode]) +
-                              seq.to_bytes(8, "big") + bytes([d]) +
-                              c.to_bytes(4, "big")).digest()
+        h = base.copy()
+        h.update(c.to_bytes(4, "big"))
+        out += h.digest()
         c += 1
     return bytes(out[:n])
 
@@ -318,6 +322,13 @@ class Session:
         with self.cond:
             self.closed = True
             self.cond.notify_all()
+        # shutdown ANTES de close: con recv() sin timeout, close() desde otro hilo
+        # no desbloquea al reader (se queda colgado, fugando hilos y conexiones al
+        # sshd). shutdown(RDWR) interrumpe el recv y el reader termina.
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         try:
             self.sock.close()
         except Exception:
