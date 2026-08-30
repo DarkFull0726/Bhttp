@@ -136,17 +136,15 @@ def send_frame(sock, sess, mode, seq, status, payload):
     body = mask(payload, sess, mode, seq, 1) if payload else b""
     sock.sendall(bytes([status]) + len(body).to_bytes(4, "big") + body)
 
-def send_data(sock, sess, mode, seq, data, envelope):
-    # respuesta de bajada con envelope de tamano fijo (status 2), como espera la app:
-    #   [4B longitud_real BE EN CLARO] [datos enmascarados] [relleno] hasta 'envelope'
-    # El prefijo de longitud va sin mascara (el cliente lo lee del crudo antes de
-    # desenmascarar, Lbw.y()); solo los datos se enmascaran, desde el contador 0.
-    # Tamano fijo = anti-DPI; el chunk vacio (longitud 0) tambien es valido.
+def send_data(sock, sess, mode, seq, data):
+    # respuesta de bajada (status 2) en el formato exacto que valida la app:
+    #   [4B longitud_real BE][2B reservado] [datos enmascarados]
+    # El prefijo son 6 bytes EN CLARO; los datos empiezan en el offset 6 y van
+    # enmascarados desde el contador 0. NO lleva relleno: el cliente exige que
+    # longitud_real == body.length - 6 (BhttpBridge.downloadBatch).
     real = len(data)
     masked = mask(data, sess, mode, seq, 1) if data else b""
-    body = real.to_bytes(4, "big") + masked
-    if len(body) < envelope:
-        body += b"\x00" * (envelope - len(body))
+    body = real.to_bytes(4, "big") + b"\x00\x00" + masked
     sock.sendall(bytes([2]) + len(body).to_bytes(4, "big") + body)
 
 def send_error(sock, msg):
@@ -303,21 +301,23 @@ class Server:
                 if mode == 1:                      # subida (len 0 = solo abrir)
                     s.upload(seq, payload)
                     send_frame(conn, sess, mode, seq, 0, b"")
-                elif mode == 2:                    # bajada
-                    env = ln if ln > 4 else 1399   # tamano fijo del envelope
-                    chunk = s.download(seq, env - 4)
-                    send_data(conn, sess, mode, seq, chunk, env)
+                elif mode == 2:                    # bajada simple
+                    chunk = s.download(seq, ln if ln > 0 else 1399)
+                    send_data(conn, sess, mode, seq, chunk)
                 elif mode == 3:                    # lote de bajadas
+                    # payload = [chunkSize:4BE][reservado:1][count:1]
                     if len(payload) >= 6:
-                        env = int.from_bytes(payload[0:4], "big")
-                        count = int.from_bytes(payload[4:6], "big")
+                        chunk_size = int.from_bytes(payload[0:4], "big")
+                        count = payload[5]
                     else:
-                        env, count = 1399, 1
-                    if env <= 4:
-                        env = 1399
+                        chunk_size, count = 1399, 1
+                    if chunk_size <= 0:
+                        chunk_size = 1399
+                    if count <= 0:
+                        count = 1
                     for i in range(count):
-                        chunk = s.download(seq + i, env - 4, wait=(i == 0))
-                        send_data(conn, sess, mode, seq + i, chunk, env)
+                        chunk = s.download(seq + i, chunk_size, wait=(i == 0))
+                        send_data(conn, sess, mode, seq + i, chunk)
                 elif mode == 4:                    # ack
                     s.ack(seq)
                     send_frame(conn, sess, mode, seq, 0, b"")
@@ -421,30 +421,34 @@ def rn(sk,n):
         if not z: raise EOFError
         b+=z
     return b
-def req(mode,seq,payload=b"",lenf=None):
-    sk=socket.create_connection(("127.0.0.1",PORT),timeout=6)
+def open_sock(): return socket.create_connection(("127.0.0.1",PORT),timeout=6)
+def send(sk,mode,seq,payload=b"",lenf=None):
     if lenf is None: lenf=len(payload)
     sk.sendall(bytes([mode])+SESS+seq.to_bytes(8,"big")+lenf.to_bytes(4,"big"))
-    if payload: sk.sendall(mask(payload,mode,seq,0))
-    h=rn(sk,5); st=h[0]; ln=int.from_bytes(h[1:5],"big")
-    body=rn(sk,ln) if ln else b""
-    sk.close()
-    if st in (0,2) and body:
-        if st==2 and ln>=4:
-            real=int.from_bytes(body[:4],"big"); body=body[4:4+real]
-        return st, mask(body,mode,seq,1)
-    return st, b""
+    if payload: sk.sendall(payload)
+def resp(sk):
+    st=rn(sk,1)[0]; ln=int.from_bytes(rn(sk,4),"big"); return st, (rn(sk,ln) if ln else b"")
 try:
-    # 1) handshake
+    # 1) handshake BHP1 (probe): payload enmascarado, respuesta status 0 con eco
     p=MAGIC+bytes([1,0])+(0).to_bytes(4,"big")
-    st,resp=req(0,0,p)
-    assert resp[:4]==MAGIC, "handshake"
-    # 2) tunel: subir algo y recibir el banner del SSH de vuelta
-    req(1,0,b"")                      # abrir sesion
-    req(1,0,b"SSH-2.0-Test\r\n")      # subir
-    st,back=req(2,0,b"",lenf=1350)    # bajar
+    sk=open_sock(); send(sk,0,0,mask(p,0,0,0)); st,body=resp(sk); sk.close()
+    assert st==0 and mask(body,0,0,1)[:4]==MAGIC, "handshake"
+    # 2) registro + subida (mode 1, status 0)
+    sk=open_sock(); send(sk,1,0,b""); assert resp(sk)[0]==0, "registro"; sk.close()
+    sk=open_sock(); send(sk,1,0,mask(b"SSH-2.0-Test\r\n",1,0,0)); resp(sk); sk.close()
+    # 3) batch (mode 3) tal cual Frontera: prefijo 6 bytes, sin relleno
+    pay=(1399).to_bytes(4,"big")+bytes([0,8])
+    sk=open_sock(); send(sk,3,0,pay)
+    back=b""; okfmt=True
+    for i in range(8):
+        st,body=resp(sk)
+        if st!=2 or len(body)<6: okfmt=False; break
+        dl=int.from_bytes(body[0:4],"big")
+        if dl!=len(body)-6: okfmt=False; break
+        if dl: back+=mask(body[6:6+dl],3,i,1)
+    sk.close()
     ok = back.startswith(b"SSH-")
-    print("HANDSHAKE_OK")
+    print("HANDSHAKE_OK" if okfmt else "FORMATO_MALO")
     print("TUNEL_OK" if ok else "TUNEL_VACIO")
     print("BANNER="+back[:40].decode("latin1").strip())
 except Exception as e:
