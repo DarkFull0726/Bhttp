@@ -138,13 +138,14 @@ def send_frame(sock, sess, mode, seq, status, payload):
 
 def send_data(sock, sess, mode, seq, data):
     # respuesta de bajada (status 2) en el formato exacto que valida la app:
-    #   [4B longitud_real BE][2B reservado] [datos enmascarados]
-    # El prefijo son 6 bytes EN CLARO; los datos empiezan en el offset 6 y van
-    # enmascarados desde el contador 0. NO lleva relleno: el cliente exige que
-    # longitud_real == body.length - 6 (BhttpBridge.downloadBatch).
+    #   [4B longitud_real BE EN CLARO] [datos enmascarados]
+    # El prefijo son 4 bytes sin mascara (el cliente hace getInt(body,0) sobre el
+    # crudo); los datos empiezan en el offset 4 y van enmascarados desde el
+    # contador 0. NO lleva relleno: el cliente exige longitud == body.length - 4
+    # (BhttpBridge.downloadBatch: arraycopy(body, 4, ...), sub-int body.length-4).
     real = len(data)
     masked = mask(data, sess, mode, seq, 1) if data else b""
-    body = real.to_bytes(4, "big") + b"\x00\x00" + masked
+    body = real.to_bytes(4, "big") + masked
     sock.sendall(bytes([2]) + len(body).to_bytes(4, "big") + body)
 
 def send_error(sock, msg):
@@ -210,7 +211,7 @@ class Session:
     def download(self, seq, maxlen, wait=True):
         if maxlen <= 0:
             maxlen = 1350
-        deadline = time.time() + (3.0 if wait else 0.0)
+        deadline = time.time() + (1.5 if wait else 0.0)
         with self.cond:
             while True:
                 if seq in self.down_chunks:
@@ -436,16 +437,17 @@ try:
     # 2) registro + subida (mode 1, status 0)
     sk=open_sock(); send(sk,1,0,b""); assert resp(sk)[0]==0, "registro"; sk.close()
     sk=open_sock(); send(sk,1,0,mask(b"SSH-2.0-Test\r\n",1,0,0)); resp(sk); sk.close()
-    # 3) batch (mode 3) tal cual Frontera: prefijo 6 bytes, sin relleno
+    # 3) batch (mode 3) tal cual Frontera: prefijo 4 bytes, sin relleno,
+    #    payload de peticion enmascarado. Valida como BhttpBridge.downloadBatch.
     pay=(1399).to_bytes(4,"big")+bytes([0,8])
-    sk=open_sock(); send(sk,3,0,pay)
+    sk=open_sock(); send(sk,3,0,mask(pay,3,0,0))
     back=b""; okfmt=True
     for i in range(8):
         st,body=resp(sk)
-        if st!=2 or len(body)<6: okfmt=False; break
+        if st!=2 or len(body)<4: okfmt=False; break
         dl=int.from_bytes(body[0:4],"big")
-        if dl!=len(body)-6: okfmt=False; break
-        if dl: back+=mask(body[6:6+dl],3,i,1)
+        if dl!=len(body)-4: okfmt=False; break
+        if dl: back+=mask(body[4:4+dl],3,i,1)
     sk.close()
     ok = back.startswith(b"SSH-")
     print("HANDSHAKE_OK" if okfmt else "FORMATO_MALO")
