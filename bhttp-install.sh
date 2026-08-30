@@ -8,10 +8,15 @@
 # El servidor hace de puente:  app (BHTTP) <-> este servidor <-> SSH local (22).
 # Osea: monta un tunel SSH-sobre-BHTTP para saltar el DPI del operador.
 #
-# Uso:  sudo bash bhttp-install.sh                 pregunta el puerto (o elige libre)
-#       sudo bash bhttp-install.sh --puerto 8080   sin preguntar
-#       sudo bash bhttp-install.sh --ssh-puerto 22 backend SSH (por defecto 22)
-#       sudo bash bhttp-install.sh --desinstalar    lo quita todo
+# Uso:  sudo bash bhttp-install.sh                      pregunta el puerto (o elige libre)
+#       sudo bash bhttp-install.sh --puerto 8080        sin preguntar
+#       sudo bash bhttp-install.sh --ssh-puerto 22      backend SSH (por defecto 22)
+#       sudo bash bhttp-install.sh --crear-usuario juan crea el usuario del tunel
+#       sudo bash bhttp-install.sh --crear-usuario juan --clave miclave
+#       sudo bash bhttp-install.sh --desinstalar        lo quita todo
+#
+# El tunel autentica con un usuario del sistema (PAM). Puedes crear uno con
+# --crear-usuario; si no pasas --clave, se genera una y se muestra al final.
 #
 # Requiere: root y python3 (viene en toda VPS moderna).
 
@@ -23,15 +28,17 @@ UNIT="/etc/systemd/system/bhttp.service"
 SERVICE="bhttp"
 CANDIDATOS=(8080 80 8443 443 2082 2095 8880 2052 3128)
 
-PUERTO=""; SSHPORT=22; DESINSTALAR=0
+PUERTO=""; SSHPORT=22; DESINSTALAR=0; NUEVO_USER=""; NUEVO_PASS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --puerto|-p)   shift; PUERTO="$1" ;;
-    --ssh-puerto)  shift; SSHPORT="$1" ;;
-    --desinstalar) DESINSTALAR=1 ;;
-    -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
-    *)             echo "opcion desconocida: $1" >&2; exit 2 ;;
+    --puerto|-p)     shift; PUERTO="$1" ;;
+    --ssh-puerto)    shift; SSHPORT="$1" ;;
+    --crear-usuario) shift; NUEVO_USER="$1" ;;
+    --clave)         shift; NUEVO_PASS="$1" ;;
+    --desinstalar)   DESINSTALAR=1 ;;
+    -h|--help)       sed -n '2,20p' "$0"; exit 0 ;;
+    *)               echo "opcion desconocida: $1" >&2; exit 2 ;;
   esac
   shift
 done
@@ -42,6 +49,45 @@ info()  { printf '  %s\n' "$*"; }
 paso()  { printf '\n[%s] %s\n' "$1" "$2"; }
 
 [ "$(id -u 2>/dev/null || echo 0)" != 0 ] && { rojo "Ejecutalo como root:  sudo bash $0"; exit 2; }
+
+# ------------------------------------------------------------ crear usuario SSH
+# El tunel autentica con un usuario del sistema (PAM). Este helper crea uno
+# pensado solo para el tunel: sin shell de login, solo sirve para el SSH.
+crear_usuario() {
+  local u="$1" p="$2"
+  if id "$u" >/dev/null 2>&1; then
+    info "el usuario '$u' ya existe; solo actualizo la clave"
+  else
+    useradd -M -s /usr/sbin/nologin "$u" 2>/dev/null \
+      || useradd -M -s /bin/false "$u" \
+      || { rojo "no pude crear el usuario '$u'"; return 1; }
+    info "usuario '$u' creado (sin shell, solo para el tunel)"
+  fi
+  if [ -z "$p" ]; then
+    p="$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 12)"
+    [ -z "$p" ] && p="dt$(date +%s | tail -c 7)"
+    info "clave generada automaticamente"
+  fi
+  echo "$u:$p" | chpasswd || { rojo "no pude poner la clave"; return 1; }
+  # nologin no deja abrir sesion SSH normal, pero el tunel (con -N, sin shell) si;
+  # aun asi permitimos el shell falso por si el cliente pide PTY.
+  USER_FINAL="$u"; PASS_FINAL="$p"
+  return 0
+}
+
+if [ -n "$NUEVO_USER" ]; then
+  echo "=== Crear usuario para el tunel ==="
+  if crear_usuario "$NUEVO_USER" "$NUEVO_PASS"; then
+    verde "Usuario listo:"
+    echo "   usuario : $USER_FINAL"
+    echo "   clave   : $PASS_FINAL"
+    echo
+    echo "   Ponlos en la app (campos usuario/clave del SSH)."
+  fi
+  # si solo se pidio crear usuario (sin nada mas), terminamos aqui
+  [ -z "$PUERTO$DESINSTALAR" ] && { echo; echo "Usuario creado. Para (re)instalar el servidor:  sudo bash $0"; exit 0; }
+  echo
+fi
 
 # ------------------------------------------------------------ desinstalar
 if [ "$DESINSTALAR" = 1 ]; then
@@ -109,6 +155,12 @@ cat > "$SERVER_PY" <<'PYEOF'
 import argparse, hashlib, socket, struct, sys, threading, time
 
 MAGIC = b"BHP1"
+# long-poll de la bajada: la conexion que pide el proximo slot espera hasta este
+# tiempo a que el backend produzca datos, y los entrega EN CUANTO llegan (el
+# reader hace notify). Debe quedar por debajo del read-timeout del cliente (~8s)
+# para que no vea "Read timed out"; asi cada round-trip del SSH es casi instantaneo
+# en vez de esperar el backoff del cliente (auth PAM que tardaba ~37s -> <2s).
+LONGPOLL = 6.0
 
 def keystream(sess, mode, seq, d, n):
     out = bytearray(); c = 0
@@ -310,7 +362,7 @@ class Server:
                     s.upload(seq, payload)
                     send_frame(conn, sess, mode, seq, 0, b"")
                 elif mode == 2:                    # bajada simple
-                    chunk = s.download(seq, ln if ln > 0 else 1399, time.time() + 0.3)
+                    chunk = s.download(seq, ln if ln > 0 else 1399, time.time() + LONGPOLL)
                     send_data(conn, sess, mode, seq, chunk)
                 elif mode == 3:                    # lote de bajadas
                     # payload = [chunkSize:4BE][reservado:1][count:1]
@@ -323,7 +375,7 @@ class Server:
                         chunk_size = 1399
                     if count <= 0:
                         count = 1
-                    deadline = time.time() + 0.3   # long-poll corto, compartido
+                    deadline = time.time() + LONGPOLL   # long-poll, compartido
                     for i in range(count):
                         chunk = s.download(seq + i, chunk_size, deadline)
                         send_data(conn, sess, mode, seq + i, chunk)
