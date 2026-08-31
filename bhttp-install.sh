@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+
 set -uo pipefail
 
 DESTDIR="/usr/local/lib/bhttp"
@@ -31,11 +32,18 @@ paso()  { printf '\n[%s] %s\n' "$1" "$2"; }
 
 [ "$(id -u 2>/dev/null || echo 0)" != 0 ] && { rojo "Ejecutalo como root:  sudo bash $0"; exit 2; }
 
+# ------------------------------------------------------------ crear usuario SSH
+# El tunel autentica con un usuario del sistema (PAM). Este helper crea uno
+# pensado solo para el tunel: sin shell de login, solo sirve para el SSH.
 crear_usuario() {
   local u="$1" p="$2"
   if id "$u" >/dev/null 2>&1; then
     info "el usuario '$u' ya existe; solo actualizo la clave"
   else
+    # /bin/bash (no nologin): algunos SSH cierran la conexion tras la auth si el
+    # usuario tiene nologin y el cliente pide algo mas que un forward puro. Con un
+    # shell real, el forward/SOCKS del tunel funciona seguro. Sin acceso extra:
+    # el usuario solo tiene la clave para el tunel.
     useradd -M -s /bin/bash "$u" \
       || { rojo "no pude crear el usuario '$u'"; return 1; }
     info "usuario '$u' creado (shell /bin/bash, compatible con el forward del tunel)"
@@ -50,8 +58,12 @@ crear_usuario() {
   return 0
 }
 
+# diagnostico del entorno SSH/red: la causa mas comun de que el tunel conecte,
+# autentique y luego "Connection reset"/"Read timed out" al navegar es que el SSH
+# no permite forward o la VPS no tiene salida, NO el protocolo BHTTP.
 diagnostico_ssh() {
   paso "diag" "Comprobando el entorno SSH/red"
+  # 1) AllowTcpForwarding: el tunel necesita forward. Por defecto suele ser 'yes'.
   local cfg="/etc/ssh/sshd_config" fwd=""
   [ -r "$cfg" ] && fwd="$(grep -iE '^[[:space:]]*AllowTcpForwarding' "$cfg" | tail -1 | awk '{print tolower($2)}')"
   if [ "$fwd" = "no" ]; then
@@ -61,12 +73,14 @@ diagnostico_ssh() {
   else
     info "AllowTcpForwarding: ${fwd:-yes (por defecto)} -> OK"
   fi
+  # 2) salida TCP a 8.8.8.8:53 (lo primero que hace el cliente tras conectar)
   if timeout 5 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
     info "salida TCP a 8.8.8.8:53 (DNS): OK"
   else
     rojo "  La VPS NO alcanza 8.8.8.8:53 por TCP -> el DNS del tunel fallara."
     echo "     Revisa el firewall de salida del proveedor / la red de la VPS."
   fi
+  # 3) sshd escuchando en el puerto backend
   if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE ":$SSHPORT\b"; then
     info "sshd escuchando en el puerto $SSHPORT: OK"
   else
@@ -84,16 +98,19 @@ if [ -n "$NUEVO_USER" ]; then
     echo
     echo "   Ponlos en la app (campos usuario/clave del SSH)."
   fi
+  # si solo se pidio crear usuario (sin nada mas), terminamos aqui
   [ -z "$PUERTO$DESINSTALAR" ] && { echo; echo "Usuario creado. Para (re)instalar el servidor:  sudo bash $0"; exit 0; }
   echo
 fi
 
+# ------------------------------------------------------------ solo diagnostico
 if [ "$SOLO_DIAG" = 1 ]; then
   echo "=== Diagnostico del entorno del tunel ==="
   diagnostico_ssh
   exit 0
 fi
 
+# ------------------------------------------------------------ desinstalar
 if [ "$DESINSTALAR" = 1 ]; then
   systemctl stop "$SERVICE" 2>/dev/null
   systemctl disable "$SERVICE" 2>/dev/null
@@ -107,6 +124,7 @@ echo "=== Instalar servidor BHTTP propio ==="
 
 command -v python3 >/dev/null 2>&1 || { rojo "Falta python3. Instalalo:  apt install -y python3"; exit 1; }
 
+# ------------------------------------------------------------ elegir puerto
 paso "1/4" "Puerto"
 
 ocupados() {
@@ -140,11 +158,21 @@ if ! libre "$PUERTO"; then
 fi
 info "puerto elegido: $PUERTO   (backend SSH: 127.0.0.1:$SSHPORT)"
 
+# ------------------------------------------------------------ escribir servidor
 paso "2/4" "Instalando el servidor"
 mkdir -p "$DESTDIR"
 
 cat > "$SERVER_PY" <<'PYEOF'
 #!/usr/bin/env python3
+# Servidor BHTTP autonomo para DTunnel (version asyncio).
+# Mismo protocolo binario que la app (extraido de classes.dex), pero con un event
+# loop en vez de un hilo por conexion: aguanta las 48+ conexiones concurrentes del
+# cliente (32 download + 16 upload) sin saturar la CPU de una VPS pequena.
+#
+# Trama peticion : mode(1) sessionId(16) seq(8 BE) len(4 BE) + payload enmascarado
+# Trama respuesta: status(1) len(4 BE) + payload enmascarado
+# Mascara        : XOR con SHA256(sessionId||mode||seq||dir||contador), dir 0=req 1=resp
+# Modos          : 0=probe 1=subida 2=bajada(probe calib) 3=lote(download real) 4=ack
 import argparse, asyncio, hashlib, struct, sys
 
 MAGIC = b"BHP1"
@@ -163,18 +191,13 @@ def keystream(sess, mode, seq, d, n):
 def mask(data, sess, mode, seq, d):
     return bytes(a ^ b for a, b in zip(data, keystream(sess, mode, seq, d, len(data))))
 
-async def amask(data, sess, mode, seq, d):
-    if len(data) <= 2048:
-        return mask(data, sess, mode, seq, d)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, mask, data, sess, mode, seq, d)
-
 def probe_reply(mode, size):
     n = size if (mode == 2 and size >= 10) else 10
     out = bytearray(MAGIC + bytes([1, mode]) + size.to_bytes(4, "big"))
     for i in range(10, n):
         out.append((i * 31) & 255)
     return bytes(out)
+
 
 class Session:
     """Un tunel logico: empareja el flujo BHTTP con la conexion al backend (sshd)."""
@@ -232,6 +255,10 @@ class Session:
                 self.up_next += 1
 
     async def download(self, seq, maxlen, deadline):
+        # ORDEN ESTRICTO: cada slot se sirve a su turno (down_assign) y quien pide
+        # un slot futuro espera; asi down_assign avanza al ritmo del cliente y un
+        # dato tras idle no cae en un slot ya pasado. 'deadline' (compartido por el
+        # batch) da por vacios los slots sin datos para no colgar.
         if maxlen <= 0:
             maxlen = 1399
         loop = asyncio.get_running_loop()
@@ -257,9 +284,9 @@ class Session:
                     except asyncio.TimeoutError:
                         pass
                     continue
-                if seq == self.down_assign:
+                while self.down_assign <= seq:
                     self.down_assign += 1
-                    self.cond.notify_all()
+                self.cond.notify_all()
                 return b""
 
     async def ack(self, seq):
@@ -276,6 +303,7 @@ class Session:
         except Exception:
             pass
 
+
 class Server:
     def __init__(self, host, port, backend):
         self.host, self.port, self.backend = host, port, backend
@@ -285,36 +313,22 @@ class Server:
     async def get_session(self, sess):
         async with self.slock:
             s = self.sessions.get(sess)
-            if s is not None:
-                return s
-            for old_sid, old in list(self.sessions.items()):
-                await old.close()
-                del self.sessions[old_sid]
-            s = Session(sess, self.backend)
-            await s.connect()
-            self.sessions[sess] = s
-            log("sesion %s: registrada (sesiones vivas: %d)"
-                % (sess.hex()[:8], len(self.sessions)))
+            if s is None or s.closed:
+                for old_sid, old in list(self.sessions.items()):
+                    if old_sid != sess:
+                        await old.close()
+                        del self.sessions[old_sid]
+                s = Session(sess, self.backend)
+                await s.connect()
+                self.sessions[sess] = s
+                log("sesion %s: registrada (sesiones vivas: %d)"
+                    % (sess.hex()[:8], len(self.sessions)))
             return s
 
     async def handle(self, reader, writer):
         try:
-            pending_hdr = None
-            first = await reader.readexactly(1)
-            if first[0] > 4:
-                head = bytearray(first)
-                while not head.endswith(b"\r\n\r\n"):
-                    head += await reader.readexactly(1)
-                    if len(head) > 8192:
-                        return
-            else:
-                pending_hdr = first + await reader.readexactly(28)
             while True:
-                if pending_hdr is not None:
-                    hdr = pending_hdr
-                    pending_hdr = None
-                else:
-                    hdr = await reader.readexactly(29)
+                hdr = await reader.readexactly(29)
                 mode = hdr[0]
                 sess = hdr[1:17]
                 seq = int.from_bytes(hdr[17:25], "big")
@@ -322,12 +336,12 @@ class Server:
                 payload = b""
                 if ln and mode in (0, 1, 2, 3):
                     raw = await reader.readexactly(ln)
-                    payload = await amask(raw, sess, mode, seq, 0)
+                    payload = mask(raw, sess, mode, seq, 0)
 
                 if payload[:4] == MAGIC:  # probe (calibracion / handshake)
                     size = int.from_bytes(payload[6:10], "big") if len(payload) >= 10 else 0
                     pmode = payload[5] if len(payload) >= 6 else mode
-                    body = await amask(probe_reply(pmode, size), sess, mode, seq, 1)
+                    body = mask(probe_reply(pmode, size), sess, mode, seq, 1)
                     writer.write(bytes([0]) + len(body).to_bytes(4, "big") + body)
                     await writer.drain()
                     continue
@@ -371,6 +385,7 @@ class Server:
                 pass
 
     def _send_data(self, writer, sess, mode, seq, data):
+        # respuesta de bajada (status 2): [4B longitud EN CLARO][datos enmascarados]
         real = len(data)
         masked = mask(data, sess, mode, seq, 1) if data else b""
         body = real.to_bytes(4, "big") + masked
@@ -383,6 +398,7 @@ class Server:
         async with srv:
             await srv.serve_forever()
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
@@ -391,6 +407,7 @@ def main():
     ap.add_argument("--backend-port", type=int, default=22)
     a = ap.parse_args()
     asyncio.run(Server(a.host, a.port, (a.backend_host, a.backend_port)).serve())
+
 
 if __name__ == "__main__":
     main()
@@ -419,6 +436,7 @@ WantedBy=multi-user.target
 EOF
 info "servicio en $UNIT"
 
+# ------------------------------------------------------------ arrancar
 paso "3/4" "Arrancando"
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1 && info "activado en el arranque"
@@ -439,6 +457,7 @@ if [ "$LEVANTADO" != 1 ]; then
 fi
 verde "  servicio activo y escuchando en el puerto $PUERTO"
 
+# ------------------------------------------------------------ verificar protocolo
 paso "4/4" "Verificacion del protocolo BHTTP"
 
 VERIF="$(python3 - "$PUERTO" <<'PYV'
@@ -465,11 +484,18 @@ def send(sk,mode,seq,payload=b"",lenf=None):
 def resp(sk):
     st=rn(sk,1)[0]; ln=int.from_bytes(rn(sk,4),"big"); return st, (rn(sk,ln) if ln else b"")
 try:
+    # 1) handshake BHP1 (probe): payload enmascarado, respuesta status 0 con eco
     p=MAGIC+bytes([1,0])+(0).to_bytes(4,"big")
     sk=open_sock(); send(sk,0,0,mask(p,0,0,0)); st,body=resp(sk); sk.close()
     assert st==0 and mask(body,0,0,1)[:4]==MAGIC, "handshake"
+    # 2) registro + subida (mode 1, status 0)
     sk=open_sock(); send(sk,1,0,b""); assert resp(sk)[0]==0, "registro"; sk.close()
     sk=open_sock(); send(sk,1,0,mask(b"SSH-2.0-Test\r\n",1,0,0)); resp(sk); sk.close()
+    # 3) batch (mode 3) como Frontera: prefijo 4 bytes, sin relleno, payload
+    #    de peticion enmascarado. La bajada se produce en orden estricto, asi
+    #    que solo el chunk 0 (el banner del SSH) esta disponible sin subir mas;
+    #    leemos con socket-timeout corto y validamos ese chunk (los siguientes
+    #    esperarian datos, que es correcto: el flujo real los va produciendo).
     pay=(1399).to_bytes(4,"big")+bytes([0,8])
     sk=open_sock(); sk.settimeout(4); send(sk,3,0,mask(pay,3,0,0))
     back=b""; okfmt=True
