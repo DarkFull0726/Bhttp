@@ -78,15 +78,16 @@ afinar_tcp() {
   cat > "$f" <<'SYSEOF'
 # Afinado para el servidor BHTTP (muchas conexiones TCP cortas y concurrentes).
 # Lo escribe bhttp-install.sh. Borralo y recarga sysctl para revertir.
+#
+# SOLO ajustes de CAPACIDAD (cola de accept, backlogs, descriptores, puertos
+# efimeros). NO se tocan tcp_fastopen, tcp_tw_reuse ni mtu_probing a proposito:
+# a traves del CGNAT de los operadores moviles esos rompen el flujo (el TCP
+# conecta pero los datos no pasan -> el SSH kex expira). Estos de aqui solo
+# suben limites y NUNCA pueden romper el paso de datos del tunel.
 net.core.somaxconn = 4096
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
 fs.file-max = 1048576
 SYSEOF
   # conntrack: solo si el modulo esta cargado (VPS con firewall/NAT). Si no
