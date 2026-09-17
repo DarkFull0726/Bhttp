@@ -89,6 +89,13 @@ net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.ip_local_port_range = 1024 65535
 fs.file-max = 1048576
+# Apagar EXPLICITAMENTE lo que una version anterior de este script pudo dejar
+# encendido (TFO/tw_reuse). Asi re-correr el script los revierte en el kernel
+# EN VIVO, sin necesidad de reiniciar la VPS. 0 = comportamiento por defecto.
+net.ipv4.tcp_fastopen = 0
+net.ipv4.tcp_tw_reuse = 0
+net.ipv4.tcp_slow_start_after_idle = 1
+net.ipv4.tcp_mtu_probing = 0
 SYSEOF
   # conntrack: solo si el modulo esta cargado (VPS con firewall/NAT). Si no
   # existe la clave, sysctl -p daria error; por eso va aparte y condicional.
