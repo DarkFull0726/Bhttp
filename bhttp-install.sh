@@ -61,6 +61,56 @@ crear_usuario() {
 # diagnostico del entorno SSH/red: la causa mas comun de que el tunel conecte,
 # autentique y luego "Connection reset"/"Read timed out" al navegar es que el SSH
 # no permite forward o la VPS no tiene salida, NO el protocolo BHTTP.
+# ------------------------------------------------------------ tuning de red (TCP)
+# Causa raiz de los "Connection reset" en masa: el cliente BHTTP abre decenas de
+# conexiones TCP CORTAS por segundo (un socket nuevo por batch/slot). En una VPS
+# sin afinar, eso choca contra:
+#   - somaxconn bajo (128): la cola de accept se llena y el kernel resetea SYNs
+#     (el backlog=512 del servidor queda capado por este valor).
+#   - LimitNOFILE bajo (1024): el proceso se queda sin descriptores -> resets.
+#   - conntrack lleno: la tabla de conexiones del firewall se satura con tanta
+#     conexion corta -> paquetes descartados.
+#   - TIME_WAIT acumulado: sin tw_reuse se agotan los puertos efimeros.
+# Esto afina todo eso a valores seguros para un tunel de alta rotacion.
+afinar_tcp() {
+  paso "tcp" "Afinando la red del sistema (reduce los Connection reset)"
+  local f="/etc/sysctl.d/99-bhttp.conf"
+  cat > "$f" <<'SYSEOF'
+# Afinado para el servidor BHTTP (muchas conexiones TCP cortas y concurrentes).
+# Lo escribe bhttp-install.sh. Borralo y recarga sysctl para revertir.
+net.core.somaxconn = 4096
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+fs.file-max = 1048576
+SYSEOF
+  # conntrack: solo si el modulo esta cargado (VPS con firewall/NAT). Si no
+  # existe la clave, sysctl -p daria error; por eso va aparte y condicional.
+  if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    echo "net.netfilter.nf_conntrack_max = 262144" >> "$f"
+  fi
+  if sysctl -p "$f" >/dev/null 2>&1; then
+    info "sysctl aplicado ($f)"
+  else
+    info "sysctl escrito en $f (se aplicara completo al reiniciar)"
+    sysctl -p "$f" 2>/dev/null | sed 's/^/    /' || true
+  fi
+  # Limite de descriptores tambien a nivel PAM/global, por si se corre a mano.
+  local l="/etc/security/limits.d/99-bhttp.conf"
+  cat > "$l" <<'LIMEOF'
+*  soft  nofile  1048576
+*  hard  nofile  1048576
+root soft nofile 1048576
+root hard nofile 1048576
+LIMEOF
+  info "limite de archivos elevado (nofile=1048576)"
+}
+
 diagnostico_ssh() {
   paso "diag" "Comprobando el entorno SSH/red"
   # 1) AllowTcpForwarding: el tunel necesita forward. Por defecto suele ser 'yes'.
@@ -115,8 +165,9 @@ if [ "$DESINSTALAR" = 1 ]; then
   systemctl stop "$SERVICE" 2>/dev/null
   systemctl disable "$SERVICE" 2>/dev/null
   rm -f "$UNIT"; rm -rf "$DESTDIR"
+  rm -f /etc/sysctl.d/99-bhttp.conf /etc/security/limits.d/99-bhttp.conf
   systemctl daemon-reload 2>/dev/null
-  verde "Servidor BHTTP desinstalado."
+  verde "Servidor BHTTP desinstalado (tuning de red revertido; reinicia para aplicar del todo)."
   exit 0
 fi
 
@@ -428,13 +479,20 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=$PYBIN $SERVER_PY --host 0.0.0.0 --port $PUERTO --backend-host 127.0.0.1 --backend-port $SSHPORT
-Restart=on-failure
-RestartSec=3
+# always (no solo on-failure): si el proceso muere bajo carga, vuelve solo.
+Restart=always
+RestartSec=2
+# Muchas conexiones concurrentes -> hacen falta muchos descriptores. El 1024 por
+# defecto se agota y aparecen "Connection reset"/"too many open files".
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 info "servicio en $UNIT"
+
+# ------------------------------------------------------------ afinar la red
+afinar_tcp
 
 # ------------------------------------------------------------ arrancar
 paso "3/4" "Arrancando"
